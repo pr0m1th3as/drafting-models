@@ -1,0 +1,91 @@
+name: Models
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Test every model, not only those that changed
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # The models' checks and tests in the newest Octave image (Ubuntu 26.04),
+  # with the newest releases of the packages they declare, from the Octave
+  # Packages index, installed by tools/ci_install.sh. A push
+  # or a pull request tests the models it changes; the weekly run, a manual
+  # run with full set, or a change to the runner or this workflow tests them
+  # all, so that a drafting release breaking an older model is caught.
+  test:
+    name: Linux, Octave latest, drafting latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Find the models to test
+        id: models
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          FULL: ${{ inputs.full }}
+          BASE: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          all=false
+          if [ "$EVENT" = schedule ] || [ "${FULL:-false}" = true ]; then
+            all=true
+          elif [ "$EVENT" = pull_request ]; then
+            git diff --name-only "origin/$BASE...HEAD" > changes.txt
+          elif [ "$EVENT" = push ] \
+               && git cat-file -e "$BEFORE^{commit}" 2> /dev/null; then
+            git diff --name-only "$BEFORE" HEAD > changes.txt
+          else
+            all=true
+          fi
+          if [ "$all" = false ] \
+             && grep -qxE 'tools/run_tests\.m|\.github/workflows/models\.yml' \
+                changes.txt; then
+            all=true
+          fi
+          if [ "$all" = true ]; then
+            echo "Testing every model"
+            echo "names=" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          names=$(sed -n 's#^models/\([^/]*\)/.*#\1#p' changes.txt | sort -u \
+                  | while read -r n; do [ -d "models/$n" ] && echo "$n"; done \
+                  | tr '\n' ' ')
+          if [ -z "$names" ]; then
+            echo "No model changed"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Testing $names"
+            echo "names=$names" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install what the models need, then test
+        if: steps.models.outputs.run == 'true'
+        shell: bash
+        env:
+          NAMES: ${{ steps.models.outputs.names }}
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "$PWD:/work" --workdir /work \
+            --env NAMES ghcr.io/gnu-octave/octave:latest bash -c '
+              set -euo pipefail
+              bash tools/ci_install.sh $NAMES
+              octave-cli --norc --no-history tools/run_tests.m $NAMES
+            '

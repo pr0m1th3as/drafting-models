@@ -1,0 +1,125 @@
+name: Site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Build every model, not only those that changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# One build at a time, each from the site the last one left
+concurrency:
+  group: site
+  cancel-in-progress: false
+
+jobs:
+  # What is built, the pages and the 3MF files, is kept on the branch
+  # built-site. Each run builds only the models changed since the commit the
+  # site was last built from, and writes the home page; tools/build_site.m
+  # builds them all when the templates, the assets, the builder or
+  # drafting's version change. tools/assemble_site.m then puts the built
+  # files, the assets and the photos from this commit together in _public,
+  # which is published; the photos are stored only once, on main.
+  build:
+    name: Build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check out the built site
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin built-site > /dev/null; then
+            git fetch --quiet origin built-site:built-site
+            git worktree add _site built-site
+          else
+            git worktree add --orphan -b built-site _site
+          fi
+
+      - name: Find what changed since the last build
+        id: changes
+        shell: bash
+        env:
+          FULL: ${{ inputs.full }}
+        run: |
+          set -euo pipefail
+          last=""
+          if [ -f _site/build.json ]; then
+            last=$(sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' _site/build.json)
+          fi
+          if [ "${FULL:-false}" != "true" ] && [ -n "$last" ] \
+             && git cat-file -e "$last^{commit}" 2> /dev/null; then
+            git diff --name-only "$last" HEAD > changes.txt
+            echo "Changed since ${last:0:7}:"; cat changes.txt
+            echo "mode=changes" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building every model"
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install what the models need, then build
+        shell: bash
+        env:
+          MODE: ${{ steps.changes.outputs.mode }}
+          SITE_URL: https://pr0m1th3as.github.io/drafting-models/
+          REPO_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = full ]; then
+            code='build_site ("_site")'
+          else
+            code='build_site ("_site", strsplit (strtrim (fileread ("changes.txt")), "\n"))'
+          fi
+          docker run --rm --user root --volume "$PWD:/work" --workdir /work \
+            --env SITE_URL --env REPO_URL --env GITHUB_SHA \
+            --env CODE="pkg load drafting; addpath tools; $code; assemble_site (\"_site\", \"_public\")" \
+            --env OWNER="$(id -u):$(id -g)" \
+            ghcr.io/gnu-octave/octave:latest bash -c '
+              set -euo pipefail
+              bash tools/ci_install.sh
+              apt-get install --yes -qq imagemagick > /dev/null
+              octave-cli --norc --no-history --eval "$CODE"
+              chown -R "$OWNER" _site _public
+            '
+
+      - name: Keep what was built
+        shell: bash
+        working-directory: _site
+        run: |
+          set -euo pipefail
+          git add --all
+          if git diff --cached --quiet; then
+            echo "Nothing new was built"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "Build from ${GITHUB_SHA:0:7}"
+          git push origin built-site
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _public
+
+  deploy:
+    name: Publish the site
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

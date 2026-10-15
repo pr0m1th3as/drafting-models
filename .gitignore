@@ -1,0 +1,10 @@
+# Files a model writes when asked; meshes and STEP go up as release assets
+*.3mf
+*.step
+*.stp
+*.stl
+octave-workspace
+
+# The site, built by tools/build_site.m
+_site/
+_public/
